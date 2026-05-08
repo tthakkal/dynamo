@@ -1,0 +1,930 @@
+# syntax=docker/dockerfile:1.10.0-labs
+# SPDX-FileCopyrightText: Copyright (c) 2024-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# === BEGIN templates/args.Dockerfile ===
+##########################
+#### Build Arguments #####
+##########################
+# TARGETARCH is set automatically by Docker BuildKit for every --platform build.
+# It must NOT be declared in the global scope (before any FROM) — doing so shadows
+# the automatic per-platform value that BuildKit injects.
+#
+# In each stage that needs it, re-declare with:  ARG TARGETARCH
+#
+# ARCH_ALT (x86_64 / aarch64) is computed inline in RUN steps:
+#   ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64")
+ARG DEVICE=xpu
+
+# Python/CUDA configuration
+ARG PYTHON_VERSION=3.12
+
+# Base and runtime images configuration
+ARG BASE_IMAGE=intel/deep-learning-essentials
+ARG BASE_IMAGE_TAG=2025.3.2-0-devel-ubuntu24.04
+ARG RUNTIME_IMAGE=intel/deep-learning-essentials
+ARG RUNTIME_IMAGE_TAG=2025.3.2-0-devel-ubuntu24.04
+
+# wheel builder image selection
+
+ARG WHEEL_BUILDER_IMAGE=${BASE_IMAGE}:${BASE_IMAGE_TAG}
+
+# Build configuration
+ARG ENABLE_KVBM=true
+ARG CARGO_BUILD_JOBS
+
+ARG NATS_VERSION=v2.10.28
+ARG ETCD_VERSION=v3.5.21
+
+ARG ENABLE_MEDIA_FFMPEG=false
+ARG FFMPEG_VERSION=8.1
+
+# SCCACHE configuration
+ARG USE_SCCACHE
+ARG SCCACHE_BUCKET=""
+ARG SCCACHE_REGION=""
+
+# NIXL configuration
+ARG NIXL_UCX_REF=v1.20.x
+ARG NIXL_REF=0.10.1
+
+# Make sure to update the dependency version in pyproject.toml when updating this
+ARG VLLM_REF=v0.19.1
+ARG MAX_JOBS=10
+
+ARG LMCACHE_REF=0.4.2
+ARG VLLM_OMNI_REF=release/v0.19.0rc1
+
+# --- Base Image Stages
+
+# === BEGIN templates/dynamo_base.Dockerfile ===
+##################################
+########## Base Image ############
+##################################
+
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS dynamo_base
+
+ARG TARGETARCH
+
+USER root
+WORKDIR /opt/dynamo
+
+# Install sccache into the base image so downstream stages can COPY it
+# instead of downloading from GitHub (avoids 502 errors under parallel builds)
+ARG SCCACHE_VERSION=v0.14.0
+RUN ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
+    wget --tries=3 --waitretry=5 \
+        "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-${ARCH_ALT}-unknown-linux-musl.tar.gz" && \
+    tar -xzf "sccache-${SCCACHE_VERSION}-${ARCH_ALT}-unknown-linux-musl.tar.gz" && \
+    mv "sccache-${SCCACHE_VERSION}-${ARCH_ALT}-unknown-linux-musl/sccache" /usr/local/bin/ && \
+    rm -rf sccache*
+
+# Install uv package manager
+# TODO: Pin uv image to a specific version tag for reproducibility (e.g. ghcr.io/astral-sh/uv:0.10.7)
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Install NATS server
+ARG NATS_VERSION
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    wget --tries=3 --waitretry=5 https://github.com/nats-io/nats-server/releases/download/${NATS_VERSION}/nats-server-${NATS_VERSION}-${TARGETARCH}.deb && \
+    dpkg -i nats-server-${NATS_VERSION}-${TARGETARCH}.deb && rm nats-server-${NATS_VERSION}-${TARGETARCH}.deb
+
+# Install etcd
+ARG ETCD_VERSION
+RUN wget --tries=3 --waitretry=5 https://github.com/etcd-io/etcd/releases/download/$ETCD_VERSION/etcd-$ETCD_VERSION-linux-${TARGETARCH}.tar.gz -O /tmp/etcd.tar.gz && \
+    mkdir -p /usr/local/bin/etcd && \
+    tar -xvf /tmp/etcd.tar.gz -C /usr/local/bin/etcd --strip-components=1 && \
+    rm /tmp/etcd.tar.gz
+ENV PATH=/usr/local/bin/etcd/:$PATH
+
+# Rust Setup
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH \
+    RUST_VERSION=1.93.1
+
+# Install Rust — ARCH_ALT (x86_64/aarch64) is derived from TARGETARCH at build time
+RUN ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
+    RUSTARCH="${ARCH_ALT}-unknown-linux-gnu" && \
+    wget --tries=3 --waitretry=5 "https://static.rust-lang.org/rustup/archive/1.28.1/${RUSTARCH}/rustup-init" && \
+    chmod +x rustup-init && \
+    ./rustup-init -y --no-modify-path --profile minimal --default-toolchain $RUST_VERSION --default-host ${RUSTARCH} && \
+    rm rustup-init && \
+    chmod -R a+w $RUSTUP_HOME $CARGO_HOME
+
+# === BEGIN templates/wheel_builder.Dockerfile ===
+##################################
+##### Wheel Build Image ##########
+##################################
+
+##################################
+##### wheel_builder_base #########
+##################################
+# Shared base for all wheel builds: tools, system deps, and native libraries (except nixl).
+
+FROM ${WHEEL_BUILDER_IMAGE} AS wheel_builder_base
+
+# Redeclare ARGs for this stage
+ARG TARGETARCH
+ARG CARGO_BUILD_JOBS
+ARG DEVICE
+
+WORKDIR /workspace
+
+RUN apt clean && apt-get update -y && \
+    apt-get install -y --no-install-recommends --fix-missing \
+    curl ca-certificates zip unzip git lsb-release numactl wget vim \
+    libsndfile1 \
+    libsm6 \
+    libxext6 \
+    libgl1 \
+    libaio-dev \
+    linux-libc-dev
+
+# Set environment variables first so they can be used in COPY commands
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-16} \
+    RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    CARGO_TARGET_DIR=/opt/dynamo/target \
+    PATH=/usr/local/cargo/bin:$PATH
+
+# Copy artifacts from base stage
+COPY --from=dynamo_base $RUSTUP_HOME $RUSTUP_HOME
+COPY --from=dynamo_base $CARGO_HOME $CARGO_HOME
+
+RUN wget --no-check-certificate -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+    # Manually add kobuk-team/intel-graphics PPA to avoid add-apt-repository contacting api.launchpad.net \
+    # (blocked by corporate proxy). Using [trusted=yes] as the key server is also unreachable. \
+    . /etc/os-release && \
+    printf 'Acquire::https::ppa.launchpadcontent.net::Verify-Peer "false";\nAcquire::https::ppa.launchpadcontent.net::Verify-Host "false";\n' \
+        > /etc/apt/apt.conf.d/99launchpad-noverify && \
+    echo "deb [trusted=yes] https://ppa.launchpadcontent.net/kobuk-team/intel-graphics/ubuntu ${UBUNTU_CODENAME:-noble} main" \
+        | tee /etc/apt/sources.list.d/kobuk-team-intel-graphics.list
+
+# Fetch UCX patch
+RUN wget --tries=3 --waitretry=5 https://raw.githubusercontent.com/intel/llm-scaler/35a14cbc08d714f460a29b7a7328df5620c8530f/vllm/patches/ai-dynamo-xpu/patches/ucx-v1.12.0.patch -O /tmp/ucx.patch
+
+# Install Intel GPU runtime packages
+RUN apt update -y && apt upgrade -y && \
+    apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd  \
+    libze-intel-gpu-raytracing intel-ocloc intel-oneapi-compiler-dpcpp-cpp-2025.3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+RUN apt-get update -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        # NIXL build dependencies
+        autoconf \
+        automake \
+        cmake \
+        git-lfs \
+        libtool \
+        meson \
+        net-tools \
+        ninja-build \
+        pybind11-dev \
+        # Rust build dependencies
+        clang \
+        libclang-dev \
+        protobuf-compiler \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y install --reinstall --no-install-recommends \
+        libibverbs-dev \
+        rdma-core \
+        ibverbs-utils \
+        libibumad-dev \
+        libnuma-dev \
+        librdmacm-dev \
+        ibverbs-providers \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Ensure a modern protoc is available (required for --experimental_allow_proto3_optional)
+RUN set -eux; \
+    ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64"); \
+    PROTOC_VERSION=25.3; \
+    case "${ARCH_ALT}" in \
+      x86_64) PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-x86_64.zip" ;; \
+      aarch64) PROTOC_ZIP="protoc-${PROTOC_VERSION}-linux-aarch_64.zip" ;; \
+      *) echo "Unsupported architecture: ${ARCH_ALT}" >&2; exit 1 ;; \
+    esac; \
+    wget --tries=3 --waitretry=5 -O /tmp/protoc.zip "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/${PROTOC_ZIP}"; \
+    rm -f /usr/local/bin/protoc /usr/bin/protoc; \
+    unzip -o /tmp/protoc.zip -d /usr/local bin/protoc include/*; \
+    chmod +x /usr/local/bin/protoc; \
+    ln -s /usr/local/bin/protoc /usr/bin/protoc; \
+    protoc --version
+
+# Point build tools explicitly at the modern protoc
+ENV PROTOC=/usr/local/bin/protoc
+
+# Install uv package manager
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+ENV LD_LIBRARY_PATH=/usr/local/lib:/usr/local/lib64:${LD_LIBRARY_PATH:-}
+
+# Create virtual environment for building wheels
+ARG PYTHON_VERSION
+ENV VIRTUAL_ENV=/workspace/.venv
+# Cache uv downloads; uv handles its own locking for this cache.
+RUN --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    export UV_CACHE_DIR=/root/.cache/uv UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv venv ${VIRTUAL_ENV} --python $PYTHON_VERSION && \
+    uv pip install --upgrade meson pybind11 patchelf maturin[patchelf] tomlkit
+
+ARG NIXL_UCX_REF
+
+# sccache binary is pre-installed in dynamo_base; stage it off-PATH so
+# Meson doesn't auto-detect it as a CUDA compiler launcher
+# (https://github.com/mesonbuild/meson/issues/11118).
+# When USE_SCCACHE=true the RUN below symlinks it onto PATH before install.
+COPY --from=dynamo_base /usr/local/bin/sccache /opt/sccache/sccache
+
+ARG USE_SCCACHE
+ARG SCCACHE_BUCKET
+ARG SCCACHE_REGION
+COPY container/use-sccache.sh /tmp/use-sccache.sh
+RUN if [ "$USE_SCCACHE" = "true" ]; then \
+        ln -s /opt/sccache/sccache /usr/local/bin/sccache && \
+        /tmp/use-sccache.sh install; \
+    fi
+
+# Set SCCACHE environment variables (RUSTC_WRAPPER is set dynamically by
+# setup-env only when the sccache server starts successfully)
+ENV SCCACHE_BUCKET=${USE_SCCACHE:+${SCCACHE_BUCKET}} \
+    SCCACHE_REGION=${USE_SCCACHE:+${SCCACHE_REGION}}
+
+# Always build FFmpeg so libs are available for Rust checks in CI
+# Do not delete the source tarball for legal reasons
+ARG FFMPEG_VERSION
+RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
+    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
+    if [ "$USE_SCCACHE" = "true" ]; then \
+        eval $(/tmp/use-sccache.sh setup-env); \
+    fi && \
+    if [ "$DEVICE" = "xpu" ] || [ "$DEVICE" = "cpu" ]; then \
+    apt-get update -y && apt-get install -y build-essential pkg-config xz-utils; \
+    apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    elif [ "$DEVICE" = "cuda" ]; then \
+    dnf install -y pkg-config xz; \
+    fi && \
+    cd /tmp && \
+    curl --retry 5 --retry-delay 3 -LO https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz && \
+    tar xf ffmpeg-${FFMPEG_VERSION}.tar.xz && \
+    cd ffmpeg-${FFMPEG_VERSION} && \
+    ./configure \
+        --prefix=/usr/local \
+        --disable-gpl \
+        --disable-nonfree \
+        --disable-programs \
+        --disable-doc \
+        --disable-static \
+        --disable-x86asm \
+        --disable-network \
+        --disable-encoders \
+        --disable-muxers \
+        --disable-bsfs \
+        --disable-devices \
+        --disable-libdrm \
+        --enable-shared && \
+    make -j$(nproc) && \
+    make install && \
+    /tmp/use-sccache.sh show-stats "FFMPEG" && \
+    ldconfig && \
+    mkdir -p /usr/local/src/ffmpeg && \
+    find /tmp/ffmpeg-${FFMPEG_VERSION} \( -name config.log -o -name config.status \) -delete && \
+    mv /tmp/ffmpeg-${FFMPEG_VERSION}* /usr/local/src/ffmpeg/
+
+# Build and install UCX
+RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
+    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
+    if [ "$USE_SCCACHE" = "true" ]; then \
+        eval $(/tmp/use-sccache.sh setup-env); \
+    fi && \
+    cd /usr/local/src && \
+    git clone https://github.com/openucx/ucx.git && \
+    cd ucx &&  \
+    git checkout $NIXL_UCX_REF &&	 \
+    if [ "$DEVICE" = "xpu" ]; then \
+    git apply --ignore-whitespace /tmp/ucx.patch; \
+    fi && \
+    ./autogen.sh &&      \
+    if [ "$DEVICE" = "xpu" ]; then \
+     ./contrib/configure-release     \
+        --prefix=/usr/local/ucx     \
+        --with-ze                   \
+        --enable-shared             \
+        --disable-static            \
+        --disable-doxygen-doc       \
+        --enable-optimizations      \
+        --enable-cma                \
+        --enable-devel-headers      \
+        --with-verbs                \
+        --with-dm                   \
+        --with-efa                  \
+        --without-cuda              \
+        --enable-mt;                 \
+    elif [ "$DEVICE" = "cuda" ]; then \
+     ./contrib/configure-release     \
+        --prefix=/usr/local/ucx     \
+        --enable-shared             \
+        --disable-static            \
+        --disable-doxygen-doc       \
+        --enable-optimizations      \
+        --enable-cma                \
+        --enable-devel-headers      \
+        --with-cuda=/usr/local/cuda \
+        --with-verbs                \
+        --with-dm                   \
+        --with-gdrcopy=/usr/local   \
+        --with-efa                  \
+        --enable-mt;                 \
+    elif [ "$DEVICE" = "cpu" ]; then  \
+     ./contrib/configure-release     \
+        --prefix=/usr/local/ucx     \
+        --enable-shared             \
+        --disable-static            \
+        --disable-doxygen-doc       \
+        --enable-optimizations      \
+        --enable-cma                \
+        --enable-devel-headers      \
+        --with-verbs                \
+        --without-cuda              \
+        --enable-mt;                 \
+     fi && \
+     make -j &&                      \
+     make -j install-strip &&        \
+     /tmp/use-sccache.sh show-stats "UCX" && \
+     echo "/usr/local/ucx/lib" > /etc/ld.so.conf.d/ucx.conf && \
+     echo "/usr/local/ucx/lib/ucx" >> /etc/ld.so.conf.d/ucx.conf && \
+     ldconfig
+
+##################################
+##### runtime_wheel_builder ######
+##################################
+# Builds ai-dynamo, ai-dynamo-runtime, and gpu_memory_service wheels, sans nixl.
+
+FROM wheel_builder_base AS runtime_wheel_builder
+
+# Copy source code (order matters for layer caching)
+COPY .cargo/ /opt/dynamo/.cargo/
+COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
+COPY lib/ /opt/dynamo/lib/
+COPY components/ /opt/dynamo/components/
+
+# Build ai-dynamo (pure Python) and ai-dynamo-runtime (maturin) wheels
+ARG USE_SCCACHE
+ARG ENABLE_MEDIA_FFMPEG
+RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
+    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
+    --mount=type=cache,target=/root/.cargo/git,sharing=shared \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export UV_CACHE_DIR=/root/.cache/uv && \
+    export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
+    if [ "$USE_SCCACHE" = "true" ]; then \
+        eval $(/tmp/use-sccache.sh setup-env cmake); \
+    fi && \
+    mkdir -p ${CARGO_TARGET_DIR} && \
+    source ${VIRTUAL_ENV}/bin/activate && \
+    cd /opt/dynamo && \
+    uv build --wheel --out-dir /opt/dynamo/dist && \
+    cd /opt/dynamo/lib/bindings/python && \
+    if [ "$ENABLE_MEDIA_FFMPEG" = "true" ]; then \
+        maturin build --release --features "media-ffmpeg,kv-indexer" --out /opt/dynamo/dist; \
+    else \
+        maturin build --release --features "kv-indexer" --out /opt/dynamo/dist; \
+    fi && \
+    /tmp/use-sccache.sh show-stats "Dynamo Runtime"
+
+# Build gpu-memory-service wheel → /opt/dynamo/dist/gpu_memory_service*.whl (small C++ extension, fast build -- all targets, all frameworks)
+
+##################################
+##### wheel_builder ##############
+##################################
+
+# Builds nixl (native + Python wheel) and kvbm wheel, then consolidates all wheels.
+# Runtime templates COPY from this stage.
+
+FROM wheel_builder_base AS wheel_builder
+
+# Build and install nixl
+ARG TARGETARCH
+ARG DEVICE
+ARG NIXL_REF
+ARG USE_SCCACHE
+
+RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
+    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
+    if [ "$USE_SCCACHE" = "true" ]; then \
+        eval $(/tmp/use-sccache.sh setup-env); \
+    fi && \
+    source ${VIRTUAL_ENV}/bin/activate && \
+    git clone "https://github.com/ai-dynamo/nixl.git" && \
+    cd nixl && \
+    git checkout ${NIXL_REF} && \
+    if [ "$DEVICE" = "cuda" ]; then \
+        PKG_NAME="nixl-cu${CUDA_MAJOR}"; \
+    else \
+        PKG_NAME="nixl-${DEVICE}"; \
+    fi && \
+    ./contrib/tomlutil.py --wheel-name $PKG_NAME pyproject.toml && \
+    mkdir build && \
+    if [ "$DEVICE" = "cuda" ]; then \
+        meson setup build/ --prefix=/opt/nvidia/nvda_nixl --buildtype=release \
+            -Dcudapath_lib="/usr/local/cuda/lib64" \
+            -Dcudapath_inc="/usr/local/cuda/include" \
+            -Ducx_path="/usr/local/ucx" \
+            -Dlibfabric_path="/usr/local/libfabric"; \
+    elif [ "$DEVICE" = "xpu" ]; then \
+        meson setup build/ --prefix=/opt/intel/intel_nixl --buildtype=release \
+            -Ducx_path="/usr/local/ucx"; \
+    elif [ "$DEVICE" = "cpu" ]; then \
+        meson setup build/ --prefix=/opt/nvidia/nvda_nixl --buildtype=release \
+            -Ducx_path="/usr/local/ucx"; \
+    fi && \
+    cd build && \
+    ninja && \
+    ninja install && \
+    /tmp/use-sccache.sh show-stats "NIXL"
+
+ENV NIXL_LIB_DIR=/opt/intel/intel_nixl/lib/x86_64-linux-gnu \
+    NIXL_PLUGIN_DIR=/opt/intel/intel_nixl/lib/x86_64-linux-gnu/plugins \
+    NIXL_PREFIX=/opt/intel/intel_nixl
+
+ENV LD_LIBRARY_PATH=${NIXL_LIB_DIR}:${NIXL_PLUGIN_DIR}:/usr/local/ucx/lib:/usr/local/ucx/lib/ucx:${LD_LIBRARY_PATH}
+
+RUN echo "$NIXL_LIB_DIR" > /etc/ld.so.conf.d/nixl.conf && \
+    echo "$NIXL_PLUGIN_DIR" >> /etc/ld.so.conf.d/nixl.conf && \
+    ldconfig
+
+# Build NIXL wheel → /opt/dynamo/dist/nixl/nixl*.whl (C++ transport library, all targets)
+ARG PYTHON_VERSION
+RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
+    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export UV_CACHE_DIR=/root/.cache/uv && \
+    export SCCACHE_S3_KEY_PREFIX="${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}}" && \
+    if [ "$USE_SCCACHE" = "true" ]; then \
+        eval $(/tmp/use-sccache.sh setup-env); \
+    fi && \
+    cd /workspace/nixl && \
+    uv build . --wheel --out-dir /opt/dynamo/dist/nixl --python $PYTHON_VERSION
+
+# Copy source code (order matters for layer caching)
+COPY .cargo/ /opt/dynamo/.cargo/
+COPY pyproject.toml README.md LICENSE Cargo.toml Cargo.lock rust-toolchain.toml hatch_build.py /opt/dynamo/
+COPY lib/ /opt/dynamo/lib/
+COPY components/ /opt/dynamo/components/
+
+# Build kvbm wheel (with nixl linkage via auditwheel repair)
+ARG ENABLE_KVBM
+RUN --mount=type=secret,id=aws-web-identity-token,target=/run/secrets/aws-token \
+    --mount=type=secret,id=aws-role-arn,env=AWS_ROLE_ARN \
+    --mount=type=cache,target=/root/.cargo/registry,sharing=shared \
+    --mount=type=cache,target=/root/.cargo/git,sharing=shared \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    export AWS_WEB_IDENTITY_TOKEN_FILE=/run/secrets/aws-token && \
+    export UV_CACHE_DIR=/root/.cache/uv && \
+    export SCCACHE_S3_KEY_PREFIX=${SCCACHE_S3_KEY_PREFIX:-${TARGETARCH}} && \
+    ARCH_ALT=$([ "${TARGETARCH}" = "amd64" ] && echo "x86_64" || echo "aarch64") && \
+    if [ "$USE_SCCACHE" = "true" ]; then \
+        eval $(/tmp/use-sccache.sh setup-env cmake); \
+    fi && \
+    mkdir -p ${CARGO_TARGET_DIR} && \
+    source ${VIRTUAL_ENV}/bin/activate && \
+    if [ "$ENABLE_KVBM" = "true" ]; then \
+        cd /opt/dynamo/lib/bindings/kvbm && \
+        KVBM_FEATURES=""; \
+        if [ "$DEVICE" = "cuda" ]; then KVBM_FEATURES="--features nccl"; fi && \
+        maturin build --release ${KVBM_FEATURES} --out target/wheels && \
+        if [ "$DEVICE" = "cuda" ]; then \
+            auditwheel repair \
+                --exclude libnixl.so \
+                --exclude libnixl_build.so \
+                --exclude libnixl_common.so \
+                --exclude 'lib*.so*' \
+                --plat manylinux_2_28_${ARCH_ALT} \
+                --wheel-dir /opt/dynamo/dist \
+                target/wheels/*.whl; \
+        elif [ "$DEVICE" = "xpu" ] || [ "$DEVICE" = "cpu" ]; then \
+            cp target/wheels/*.whl /opt/dynamo/dist/; \
+        fi; \
+    fi && \
+    /tmp/use-sccache.sh show-stats "Dynamo KVBM"
+
+# Consolidate all wheels from the runtime wheel builder stage
+COPY --from=runtime_wheel_builder /opt/dynamo/dist/ /opt/dynamo/dist/
+
+# --- SGLang Stages
+
+# --- No SGLANG stages included
+
+# --- VLLM Stages
+
+# === BEGIN templates/vllm_framework.Dockerfile ===
+########################################################
+########## Framework Development Image ################
+########################################################
+#
+# PURPOSE: Framework development and vLLM compilation
+#
+# This stage builds and compiles framework dependencies including:
+# - vLLM inference engine with CUDA/XPU/CPU support
+# - DeepGEMM and FlashInfer optimizations
+# - All necessary build tools and compilation dependencies
+# - Framework-level Python packages and extensions
+#
+# Use this stage when you need to:
+# - Build vLLM from source with custom modifications
+# - Develop or debug framework-level components
+# - Create custom builds with specific optimization flags
+#
+
+# Use dynamo base image (see /container/Dockerfile for more details)
+FROM ${BASE_IMAGE}:${BASE_IMAGE_TAG} AS framework
+
+COPY --from=dynamo_base /bin/uv /bin/uvx /bin/
+
+ARG PYTHON_VERSION
+ARG DEVICE
+
+RUN apt clean && apt-get update -y && \
+    apt-get install -y --no-install-recommends --fix-missing \
+    curl ca-certificates zip unzip git lsb-release numactl wget vim
+
+# Cache apt downloads; sharing=locked avoids apt/dpkg races with concurrent builds.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update -y \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        # Python runtime - CRITICAL for virtual environment to work
+        python${PYTHON_VERSION}-dev \
+        build-essential \
+        # vLLM build dependencies
+        cmake \
+        ibverbs-providers \
+        ibverbs-utils \
+        libibumad-dev \
+        libibverbs-dev \
+        libnuma-dev \
+        librdmacm-dev \
+        rdma-core \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# if libmlx5.so not shipped with 24.04 rdma-core packaging, CMAKE will fail when looking for
+# generic dev name .so so we symlink .s0.1 -> .so
+RUN ln -sf /usr/lib/aarch64-linux-gnu/libmlx5.so.1 /usr/lib/aarch64-linux-gnu/libmlx5.so || true
+
+# Create virtual environment
+RUN mkdir -p /opt/dynamo/venv && \
+    export UV_CACHE_DIR=/root/.cache/uv && \
+    uv venv /opt/dynamo/venv --python $PYTHON_VERSION
+
+# Activate virtual environment
+ENV VIRTUAL_ENV=/opt/dynamo/venv \
+    PATH="/opt/dynamo/venv/bin:${PATH}"
+
+ARG TARGETARCH
+# Install vllm - keep this early in Dockerfile to avoid
+# rebuilds from unrelated source code changes
+ARG VLLM_REF
+ARG VLLM_GIT_URL
+ARG LMCACHE_REF
+ARG VLLM_OMNI_REF
+
+ARG MAX_JOBS
+ENV MAX_JOBS=$MAX_JOBS
+
+ENV VLLM_TARGET_DEVICE=xpu
+ENV VLLM_WORKER_MULTIPROC_METHOD=spawn
+
+# Install VLLM and related dependencies
+RUN --mount=type=bind,source=./container/deps/,target=/tmp/deps \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    export UV_CACHE_DIR=/root/.cache/uv UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    cp /tmp/deps/vllm/install_vllm.sh /tmp/install_vllm.sh && \
+    chmod +x /tmp/install_vllm.sh && \
+    if [ "$DEVICE" = "cpu" ] && [ "$TARGETARCH" = "amd64" ]; then \
+        export VLLM_CPU_DISABLE_AVX512=${VLLM_CPU_DISABLE_AVX512} \
+               VLLM_CPU_AVX512=${VLLM_CPU_AVX512} \
+               VLLM_CPU_AVX512BF16=${VLLM_CPU_AVX512BF16} \
+               VLLM_CPU_AVX512VNNI=${VLLM_CPU_AVX512VNNI} \
+               VLLM_CPU_AMXBF16=${VLLM_CPU_AMXBF16}; \
+    fi && \
+    /tmp/install_vllm.sh \
+        --device $DEVICE \
+        --vllm-ref $VLLM_REF \
+        --max-jobs $MAX_JOBS \
+        --arch $TARGETARCH \
+        --installation-dir /opt \
+        ${LMCACHE_REF:+--lmcache-ref "$LMCACHE_REF"} \
+        ${VLLM_OMNI_REF:+--vllm-omni-ref "$VLLM_OMNI_REF"} \
+        ${DEEPGEMM_REF:+--deepgemm-ref "$DEEPGEMM_REF"} \
+        ${FLASHINF_REF:+--flashinf-ref "$FLASHINF_REF"} \
+        ${CUDA_VERSION:+--cuda-version "$CUDA_VERSION"}
+
+# === BEGIN templates/vllm_runtime.Dockerfile ===
+##################################################
+########## Runtime Image ########################
+##################################################
+#
+# PURPOSE: Production runtime environment
+#
+# This stage creates a lightweight production-ready image containing:
+# - Pre-compiled vLLM and framework dependencies
+# - Dynamo runtime libraries and Python packages
+# - Essential runtime dependencies and configurations
+# - Optimized for inference workloads and deployment
+#
+# Use this stage when you need:
+# - Production deployment of Dynamo with vLLM
+# - Minimal runtime footprint without build tools
+# - Ready-to-run inference server environment
+# - Base for custom application containers
+#
+
+FROM ${RUNTIME_IMAGE}:${RUNTIME_IMAGE_TAG} AS runtime
+
+ARG DEVICE
+WORKDIR /workspace
+ENV DYNAMO_HOME=/opt/dynamo
+ENV VIRTUAL_ENV=/opt/dynamo/venv
+ENV PATH="${VIRTUAL_ENV}/bin:${PATH}"
+
+RUN wget --no-check-certificate -O- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB | gpg --dearmor | tee /usr/share/keyrings/oneapi-archive-keyring.gpg > /dev/null && \
+    echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" | tee /etc/apt/sources.list.d/oneAPI.list && \
+    # Manually add kobuk-team/intel-graphics PPA to avoid add-apt-repository contacting api.launchpad.net \
+    # (blocked by corporate proxy). Using [trusted=yes] as the key server is also unreachable. \
+    . /etc/os-release && \
+    printf 'Acquire::https::ppa.launchpadcontent.net::Verify-Peer "false";\nAcquire::https::ppa.launchpadcontent.net::Verify-Host "false";\n' \
+        > /etc/apt/apt.conf.d/99launchpad-noverify && \
+    echo "deb [trusted=yes] https://ppa.launchpadcontent.net/kobuk-team/intel-graphics/ubuntu ${UBUNTU_CODENAME:-noble} main" \
+        | tee /etc/apt/sources.list.d/kobuk-team-intel-graphics.list
+
+### COPY NATS & ETCD ###
+# Copy nats and etcd from dev image
+COPY --from=dynamo_base /usr/bin/nats-server /usr/bin/nats-server
+COPY --from=dynamo_base /usr/local/bin/etcd/ /usr/local/bin/etcd/
+
+# Add ETCD and CUDA binaries to PATH so cicc and other CUDA tools are accessible
+
+ENV PATH=/usr/local/bin/etcd/:$PATH
+
+# Copy uv to system /bin
+COPY --from=dynamo_base /bin/uv /bin/uvx /bin/
+
+# Create dynamo user with group 0 for OpenShift compatibility
+RUN userdel -r ubuntu > /dev/null 2>&1 || true \
+    && useradd -m -s /bin/bash -g 0 dynamo \
+    && [ `id -u dynamo` -eq 1000 ] \
+    && mkdir -p /home/dynamo/.cache /opt/dynamo \
+    # Non-recursive chown - only the directories themselves, not contents
+    && chown dynamo:0 /home/dynamo /home/dynamo/.cache /opt/dynamo /workspace \
+    # No chmod needed: umask 002 handles new files, COPY --chmod handles copied content
+    # Set umask globally for all subsequent RUN commands (must be done as root before USER dynamo)
+    # NOTE: Setting ENV UMASK=002 does NOT work - umask is a shell builtin, not an environment variable
+    && mkdir -p /etc/profile.d && echo 'umask 002' > /etc/profile.d/00-umask.sh
+
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION}
+
+# Install Python, build-essential and python3-dev as apt dependencies
+# Cache apt downloads; sharing=locked avoids apt/dpkg races with concurrent builds.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && \
+    if [ "$DEVICE" = "cuda" ]; then \
+        CUDA_VERSION_MAJOR=${CUDA_VERSION%%.*} &&\
+        CUDA_VERSION_MINOR=$(echo "${CUDA_VERSION#*.}" | cut -d. -f1); \
+    fi && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        # Python runtime - CRITICAL for virtual environment to work
+        python${PYTHON_VERSION}-dev \
+        build-essential \
+        # jq and curl for polling various endpoints and health checks
+        jq \
+        git \
+        git-lfs \
+        # required for verification of GPG keys
+        gnupg2 \
+        curl \
+        # Libraries required by UCX to find RDMA devices
+        libibverbs1 rdma-core ibverbs-utils libibumad3 \
+        libnuma1 libnuma-dev librdmacm1 ibverbs-providers \
+        # numactl CLI for NUMA binding at runtime
+        numactl \
+        # JIT Kernel Compilation, flashinfer
+        ninja-build \
+        g++ \
+        # prometheus dependencies
+        ca-certificates \
+        # opencv-python-headless (vLLM dependency) requires libxcb for some functions
+        libxcb1 && \
+    if [ "$DEVICE" = "cuda" ]; then \
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        # DeepGemm uses 'cuobjdump' which does not come with CUDA image
+        cuda-command-line-tools-${CUDA_VERSION_MAJOR}-${CUDA_VERSION_MINOR}; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends --fix-missing \
+    #ffmpeg \
+    libsndfile1 \
+    libsm6 \
+    libxext6 \
+    libgl1 \
+    lsb-release \
+    numactl \
+    wget \
+    vim \
+    linux-libc-dev && \
+    # Install Intel GPU runtime packages
+    apt-get install -y libze1 libze-dev libze-intel-gpu1 intel-opencl-icd libze-intel-gpu-raytracing \
+    intel-ocloc intel-oneapi-compiler-dpcpp-cpp-2025.3 && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+RUN wget https://github.com/uxlfoundation/oneCCL/releases/download/2021.15.7/intel-oneccl-2021.15.7.8_offline.sh && \
+    bash intel-oneccl-2021.15.7.8_offline.sh -a --silent --eula accept && \
+    echo "source /opt/intel/oneapi/setvars.sh --force" >> /etc/bash.bashrc && \
+    rm -f /opt/intel/oneapi/ccl/latest && \
+    ln -s /opt/intel/oneapi/ccl/2021.15 /opt/intel/oneapi/ccl/latest
+
+USER dynamo
+ENV HOME=/home/dynamo
+# This picks up the umask 002 from the /etc/profile.d/00-umask.sh file for subsequent RUN commands
+SHELL ["/bin/bash", "-l", "-o", "pipefail", "-c"]
+
+ENV NIXL_PREFIX=/opt/intel/intel_nixl
+ENV NIXL_LIB_DIR=$NIXL_PREFIX/lib/x86_64-linux-gnu
+ENV NIXL_PLUGIN_DIR=$NIXL_LIB_DIR/plugins
+
+# Site-packages path derived from PYTHON_VERSION ARG
+ARG SITE_PACKAGES=${VIRTUAL_ENV}/lib/python${PYTHON_VERSION}/site-packages
+
+### VIRTUAL ENVIRONMENT SETUP ###
+# Copy virtual environment from framework container, splitting large packages into separate layers
+# to enable parallel downloads. Pattern: COPY --chmod=775 <path>; chmod g+w <path> done later as
+# root because COPY --chmod only affects <path>/*, not <path>
+#
+# Layer sizes (uncompressed): nvidia=4.5GB, flashinfer_jit_cache=4.1GB, torch=2.1GB,
+#                             vllm=1.2GB, triton=592MB, flashinfer_cubin=437MB
+
+COPY --chmod=775 --chown=dynamo:0 --from=framework ${SITE_PACKAGES}/torch ${SITE_PACKAGES}/torch
+COPY --chmod=775 --chown=dynamo:0 --from=framework ${SITE_PACKAGES}/vllm ${SITE_PACKAGES}/vllm
+COPY --chmod=775 --chown=dynamo:0 --from=framework ${SITE_PACKAGES}/vllm_omni ${SITE_PACKAGES}/vllm_omni
+COPY --chmod=775 --chown=dynamo:0 --from=framework ${SITE_PACKAGES}/triton ${SITE_PACKAGES}/triton
+
+# Remaining packages and venv structure (bin/, include/, share/, etc.)
+COPY --chmod=775 --chown=dynamo:0 --from=framework \
+    --exclude=lib/python*/site-packages/nvidia \
+    --exclude=lib/python*/site-packages/flashinfer_jit_cache \
+    --exclude=lib/python*/site-packages/torch \
+    --exclude=lib/python*/site-packages/vllm \
+    --exclude=lib/python*/site-packages/vllm_omni \
+    --exclude=lib/python*/site-packages/triton \
+    --exclude=lib/python*/site-packages/flashinfer_cubin \
+    ${VIRTUAL_ENV} ${VIRTUAL_ENV}
+
+# Copy vllm with correct ownership (read-only, no group-write needed)
+COPY --chown=dynamo:0 --from=framework /opt/vllm /opt/vllm
+
+# Copy UCX and NIXL to system directories (read-only, no group-write needed)
+COPY --from=wheel_builder /usr/local/ucx /usr/local/ucx
+COPY --chown=dynamo: --from=wheel_builder $NIXL_PREFIX $NIXL_PREFIX
+
+COPY --chown=dynamo: --from=wheel_builder /opt/intel/intel_nixl/lib/x86_64-linux-gnu/. ${NIXL_LIB_DIR}/
+
+COPY --chown=dynamo: --from=wheel_builder /opt/dynamo/dist/nixl/ /opt/dynamo/wheelhouse/nixl/
+COPY --chown=dynamo: --from=wheel_builder /workspace/nixl/build/src/bindings/python/nixl-meta/nixl-*.whl /opt/dynamo/wheelhouse/nixl/
+
+ENV PATH=/usr/local/ucx/bin:$PATH
+
+ENV LD_LIBRARY_PATH=\
+$NIXL_LIB_DIR:\
+$NIXL_PLUGIN_DIR:\
+/usr/local/ucx/lib:\
+/usr/local/ucx/lib/ucx:\
+${LD_LIBRARY_PATH:-}
+
+# TODO: skip /workspace COPYs for dev/local-dev (bind-mounted from host, these get shadowed)
+COPY --chmod=664 --chown=dynamo:0 ATTRIBUTION* LICENSE /workspace/
+
+# Pattern: COPY --chmod=775 <path>; chmod g+w <path> done later as root because COPY --chmod only affects <path>/*, not <path>
+COPY --chmod=775 --chown=dynamo:0 benchmarks/ /workspace/benchmarks/
+
+# Pattern: COPY --chmod=775 <path>; chmod g+w <path> done later as root because COPY --chmod only affects <path>/*, not <path>
+COPY --chmod=775 --chown=dynamo:0 --from=wheel_builder /opt/dynamo/dist/*.whl /opt/dynamo/wheelhouse/
+
+# Install dynamo, NIXL, and dynamo-specific dependencies
+ARG ENABLE_KVBM
+RUN --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=locked \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv && \
+    uv pip install \
+      /opt/dynamo/wheelhouse/ai_dynamo_runtime*.whl \
+      /opt/dynamo/wheelhouse/ai_dynamo*any.whl \
+      /opt/dynamo/wheelhouse/nixl/nixl*.whl && \
+    if [ "${CUDA_VERSION%%.*}" = "13" ]; then \
+        uv pip uninstall -y nixl-cu12 || true; \
+    fi && \
+    if [ "${ENABLE_KVBM}" = "true" ]; then \
+        KVBM_WHEEL=$(ls /opt/dynamo/wheelhouse/kvbm*.whl 2>/dev/null | head -1); \
+        if [ -z "$KVBM_WHEEL" ]; then \
+            echo "ERROR: ENABLE_KVBM is true but no KVBM wheel found in wheelhouse" >&2; \
+            exit 1; \
+        fi; \
+        uv pip install "$KVBM_WHEEL"; \
+    fi && \
+    cd /workspace/benchmarks && \
+    export UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install . && \
+    chmod -R g+w /workspace/benchmarks
+
+# Install runtime dependencies (common + vllm-specific + benchmarks).
+# Test and dev dependencies are NOT installed here — they go in the test and dev images.
+RUN --mount=type=bind,source=./container/deps/requirements.common.txt,target=/tmp/requirements.common.txt \
+    --mount=type=bind,source=./container/deps/requirements.vllm.txt,target=/tmp/requirements.vllm.txt \
+    --mount=type=bind,source=./container/deps/requirements.benchmark.txt,target=/tmp/requirements.benchmark.txt \
+    --mount=type=cache,target=/home/dynamo/.cache/uv,uid=1000,gid=0,mode=0775,sharing=locked \
+    export UV_CACHE_DIR=/home/dynamo/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    uv pip install \
+        --requirement /tmp/requirements.common.txt \
+        --requirement /tmp/requirements.vllm.txt \
+        --requirement /tmp/requirements.benchmark.txt
+
+# Copy tests, deploy, lib, and the vllm/common/mocker component subtrees for CI.
+# Pattern: COPY --chmod=775 <path>; chmod g+w <path> done later as root because COPY --chmod only affects <path>/*, not <path>
+COPY --chmod=775 --chown=dynamo:0 tests /workspace/tests
+COPY --chmod=775 --chown=dynamo:0 examples /workspace/examples
+COPY --chmod=775 --chown=dynamo:0 deploy /workspace/deploy
+COPY --chmod=775 --chown=dynamo:0 recipes/ /workspace/recipes/
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/common /workspace/components/src/dynamo/common
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/vllm /workspace/components/src/dynamo/vllm
+COPY --chmod=775 --chown=dynamo:0 components/src/dynamo/mocker /workspace/components/src/dynamo/mocker
+COPY --chmod=775 --chown=dynamo:0 lib/ /workspace/lib/
+
+# Setup launch banner in common directory accessible to all users
+RUN --mount=type=bind,source=./container/launch_message/runtime.txt,target=/opt/dynamo/launch_message.txt \
+    sed '/^#\s/d' /opt/dynamo/launch_message.txt > /opt/dynamo/.launch_screen
+
+# Setup environment for all users
+USER root
+# Fix directory permissions: COPY --chmod only affects contents, not the directory itself
+RUN chmod g+w /workspace /workspace/* /opt/dynamo /opt/dynamo/* ${VIRTUAL_ENV} && \
+    chmod 755 /opt/dynamo/.launch_screen && \
+    echo 'source /opt/dynamo/venv/bin/activate' >> /etc/bash.bashrc && \
+    echo 'cat /opt/dynamo/.launch_screen' >> /etc/bash.bashrc
+
+USER dynamo
+
+ARG DYNAMO_COMMIT_SHA
+ENV DYNAMO_COMMIT_SHA=$DYNAMO_COMMIT_SHA
+
+RUN uv pip uninstall triton triton-xpu && \
+    uv pip install triton-xpu==3.6.0 --extra-index-url=https://download.pytorch.org/whl/test/xpu && \
+    uv pip uninstall oneccl && \
+    uv pip uninstall oneccl-devel
+
+SHELL ["bash", "-c"]
+CMD ["bash", "-c", "source /etc/bash.bashrc && exec bash"]
+
+# --- TRTLLM Stages
+
+# --- No TRTLLM stages included
+
+# --- Test Stage
+
+# === BEGIN templates/test_stage.Dockerfile ===
+FROM runtime AS runtime_test
+USER root
+RUN --mount=type=bind,source=./container/deps/requirements.test.txt,target=/tmp/requirements.test.txt \
+    --mount=type=cache,target=/root/.cache/uv,sharing=locked \
+    --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    export UV_CACHE_DIR=/root/.cache/uv UV_GIT_LFS=1 UV_HTTP_TIMEOUT=300 UV_HTTP_RETRIES=5 && \
+    export PIP_CACHE_DIR=/root/.cache/pip && \
+    if [ -n "$VIRTUAL_ENV" ]; then \
+        uv pip install \
+            --requirement /tmp/requirements.test.txt; \
+    else \
+        pip install --break-system-packages \
+            --requirement /tmp/requirements.test.txt; \
+    fi
+
+USER dynamo
+COPY --chmod=664 --chown=dynamo:0 pyproject.toml /workspace/pyproject.toml
+COPY --chmod=775 --chown=dynamo:0 benchmarks/ /workspace/benchmarks/
+
+# --- Development Stages
+
+# --- No development stages included
