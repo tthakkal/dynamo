@@ -27,20 +27,24 @@ if HAS_VLLM:
         from vllm.reasoning.qwen3_engine_reasoning_parser import (
             Qwen3ParserReasoningAdapter,
         )
+
         HAS_QWEN3_ENGINE_REASONING_PARSER = True
     except ModuleNotFoundError:
         from vllm.reasoning.qwen3_reasoning_parser import (
             Qwen3ReasoningParser as Qwen3ParserReasoningAdapter,
         )
+
         HAS_QWEN3_ENGINE_REASONING_PARSER = False
 
     try:
         from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
+
         HAS_QWEN3_ENGINE_TOOL_PARSER = True
     except ModuleNotFoundError:
         from vllm.tool_parsers.qwen3xml_tool_parser import (
             Qwen3XMLToolParser as Qwen3EngineToolParser,
         )
+
         HAS_QWEN3_ENGINE_TOOL_PARSER = False
 
     from dynamo.frontend.prepost import StreamingPostProcessor
@@ -1687,9 +1691,7 @@ def test_qwen3_streaming_buffers_function_marker_after_reasoning_end(
     if HAS_QWEN3_ENGINE_TOOL_PARSER:
         assert len(tool_calls) == 1
         assert tool_calls[0]["function"]["name"] == "get_weather"
-        assert json.loads(tool_calls[0]["function"]["arguments"]) == {
-            "location": "NYC"
-        }
+        assert json.loads(tool_calls[0]["function"]["arguments"]) == {"location": "NYC"}
     else:
         # qwen3xml fallback keeps raw marker text in streamed content for this
         # tokenization pattern and does not emit tool_calls in this specific case.
