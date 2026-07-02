@@ -67,8 +67,8 @@ vllm:
   xpu:
     base_image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo
     runtime_image: public.ecr.aws/q9t5s3a7/vllm-ci-test-repo
-    base_image_tag: ad7125a431e176d4161099480a66f0169609a690-xpu
-    runtime_image_tag: ad7125a431e176d4161099480a66f0169609a690-xpu
+    base_image_tag: 0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665-xpu
+    runtime_image_tag: 0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665-xpu
     baseline_sbom: vllm-ci-test-repo@efec382c
   cpu:
     base_image: ubuntu

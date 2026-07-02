@@ -381,7 +381,14 @@ class InstrumentedScheduler(AsyncScheduler):
     def _schedule_and_record_time(
         self, throttle_prefills: bool = False
     ) -> SchedulerOutput:
-        output = super().schedule(throttle_prefills)
+        try:
+            output = super().schedule(throttle_prefills)
+        except TypeError as exc:
+            # vLLM schedule() signature varies across versions.
+            # Fall back to a no-arg call when throttle_prefills is unsupported.
+            if "positional argument" not in str(exc):
+                raise
+            output = super().schedule()
         if output.total_num_scheduled_tokens > 0:
             self._schedule_times.append(time.monotonic())
         return output

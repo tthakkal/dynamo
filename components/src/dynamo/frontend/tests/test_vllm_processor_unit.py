@@ -13,7 +13,13 @@ from types import SimpleNamespace
 import pytest
 from _routed_engine_fakes import FakeRoutedEngine as _FakeRoutedEngine
 from transformers import AutoTokenizer
-from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
+
+try:
+    from vllm.tool_parsers.qwen3_engine_tool_parser import Qwen3EngineToolParser
+except ModuleNotFoundError:
+    from vllm.tool_parsers.qwen3xml_tool_parser import (
+        Qwen3XMLToolParser as Qwen3EngineToolParser,
+    )
 
 from dynamo.frontend.prepost import _prepare_request
 

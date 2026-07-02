@@ -171661,7 +171661,7 @@
       "bom-ref": "d4a91b038a036655",
       "name": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
       "type": "container",
-      "version": "ad7125a431e176d4161099480a66f0169609a690-xpu"
+      "version": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665-xpu"
     },
     "properties": [
       {

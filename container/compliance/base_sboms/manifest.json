@@ -70,13 +70,13 @@
       "platform": "linux/arm64"
     },
     {
-      "baseline_digest": "sha256:efec382c17b5090114ea8b2b7c8fc6678c5d1a74ce5be6676bf31082e0e44f36",
+      "baseline_digest": "sha256:34ef3e74a4888d7e89127b67990114d3f63dd46bfb84e0af2626ee3af4842ddb",
       "baseline_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
       "baseline_sbom": "vllm-ci-test-repo@efec382c-amd64.cdx.json",
-      "baseline_tag": "ad7125a431e176d4161099480a66f0169609a690-xpu",
-      "from_digest": "sha256:efec382c17b5090114ea8b2b7c8fc6678c5d1a74ce5be6676bf31082e0e44f36",
+      "baseline_tag": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665-xpu",
+      "from_digest": "sha256:34ef3e74a4888d7e89127b67990114d3f63dd46bfb84e0af2626ee3af4842ddb",
       "from_image": "public.ecr.aws/q9t5s3a7/vllm-ci-test-repo",
-      "from_tag": "ad7125a431e176d4161099480a66f0169609a690-xpu",
+      "from_tag": "0fc695fc6d1d82e9a5ac6835ac8e4e1c83703665-xpu",
       "platform": "linux/amd64"
     }
   ],

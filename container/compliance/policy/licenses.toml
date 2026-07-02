@@ -1250,6 +1250,12 @@ reason = "Mere aggregation; system component"
 
 [[exceptions]]
 type = "dpkg"
+name = "libcaca0"
+allow = ["GPL-2.0-or-later", "LGPL-2.0-or-later"]
+reason = "Mere aggregation; system component"
+
+[[exceptions]]
+type = "dpkg"
 name = "libglib2.0-0t64"
 allow = ["GPL-2.0-or-later", "LGPL-2.0-or-later", "LGPL-2.1-or-later"]
 reason = "Mere aggregation; system component"
